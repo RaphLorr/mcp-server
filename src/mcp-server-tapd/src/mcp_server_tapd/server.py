@@ -66,6 +66,57 @@ def _extract_media_items(data: dict) -> list[dict]:
 
     return [item for item in media_items if item.get("url")]
 
+_UPLOADABLE_IMAGE_EXT = {".png", ".gif", ".jpg", ".jpeg", ".bmp"}
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # TAPD upload_image 接口硬限制
+
+def _is_local_image_path(url: str) -> bool:
+    """判断是不是一个待上传的本地图片路径（而非已经可用的 URL）。
+
+    要求 MCP server 与文件所在机器是同一台；streamable-http 模式跨机部署时不成立。
+    """
+    if not url or "://" in url or url.startswith("//"):
+        return False
+    if url.startswith("/tfl/"):
+        return False  # 已经在 TAPD 图床上了
+    if os.path.splitext(url)[1].lower() not in _UPLOADABLE_IMAGE_EXT:
+        return False
+    return os.path.isfile(url)
+
+def _upload_local_images(media_items: list[dict], workspace_id) -> list[dict]:
+    """把本地图片路径上传到 TAPD 图床，替换成图床返回的 image_src。
+
+    非本地路径、非图片一律原样放行。任何一张图上传失败都直接抛出：
+    宁可整个调用失败让上层看见，也不要建出一张"图悄悄没了"的票。
+    """
+    if not workspace_id:
+        return media_items
+
+    resolved = []
+    for item in media_items:
+        url = item.get("url", "")
+        if item.get("type") != "image" or not _is_local_image_path(url):
+            resolved.append(item)
+            continue
+
+        size = os.path.getsize(url)
+        if size > _MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"图片 {url} 为 {size} 字节，超过 TAPD upload_image 的 5MB 限制，请先压缩"
+            )
+
+        ret = client.upload_image(workspace_id, url)
+        if ret.get("status") != 1:
+            raise ValueError(f"上传图片 {url} 失败：{ret.get('info')}")
+
+        payload = ret.get("data") or {}
+        image_src = payload.get("image_src")
+        if not image_src:
+            raise ValueError(f"上传图片 {url} 后返回中没有 image_src：{ret}")
+
+        resolved.append({**item, "url": image_src})
+
+    return resolved
+
 def _render_media_html(media_items: list[dict]) -> str:
     blocks = []
     for item in media_items:
@@ -91,7 +142,8 @@ def _render_rich_description(data: dict, field_name: str = "description") -> Non
     elif not isinstance(content, str):
         content = str(content)
 
-    media_html = _render_media_html(_extract_media_items(data))
+    media_items = _upload_local_images(_extract_media_items(data), data.get("workspace_id"))
+    media_html = _render_media_html(media_items)
     if field_name not in data and not media_html:
         return
 
@@ -459,8 +511,8 @@ def update_story_or_task(workspace_id: int, options: dict = None) -> str:
             - priority_label: 优先级，需要先检查get_stories_fields_info是否配置了候选值，如果不存在则使用默认的候选值 High => 高、Middle => 中、Low => 低、Nice To Have => 无关紧要，不使用 priority 字段
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单个图片直链，会以内嵌图片形式写入描述
-            - image_urls: 多个图片直链，会以内嵌图片形式写入描述
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频直链，会以内嵌视频形式写入描述
             - video_urls: 多个视频直链，会以内嵌视频形式写入描述
             - owner: 处理人
@@ -530,8 +582,8 @@ def create_story_or_task(workspace_id: int, name: str, options: dict = None) -> 
             - priority_label: 优先级，需要先检查get_stories_fields_info是否配置了候选值，如果不存在则使用默认的候选值 High => 高、Middle => 中、Low => 低、Nice To Have => 无关紧要，不使用 priority 字段
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单个图片直链，会以内嵌图片形式写入描述
-            - image_urls: 多个图片直链，会以内嵌图片形式写入描述
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频直链，会以内嵌视频形式写入描述
             - video_urls: 多个视频直链，会以内嵌视频形式写入描述
             - owner: 处理人
@@ -783,8 +835,8 @@ def update_bug(workspace_id: int, options: dict = None) -> dict:
             - title: 标题
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单个图片直链，会以内嵌图片形式写入描述
-            - image_urls: 多个图片直链，会以内嵌图片形式写入描述
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频直链，会以内嵌视频形式写入描述
             - video_urls: 多个视频直链，会以内嵌视频形式写入描述
             - v_status: 状态别名(支持传入中文状态名称)，默认用这个字段
@@ -843,8 +895,8 @@ def create_bug(workspace_id: int, title: str, options: dict = None) -> dict:
             - confirmer: 验证人员
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单个图片直链，会以内嵌图片形式写入描述
-            - image_urls: 多个图片直链，会以内嵌图片形式写入描述
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频直链，会以内嵌视频形式写入描述
             - video_urls: 多个视频直链，会以内嵌视频形式写入描述
             - priority_label: 优先级，需要先检查get_entity_custom_fields是否配置了自定义候选值，没有的话用默认的候选值 urgent=> 紧急、high=> 高、medium=> 中、low=> 低、insignificant=> 无关紧要，不使用 priority
@@ -907,8 +959,8 @@ def create_comments(workspace_id: int, options: dict = None) -> dict:
             - author: 评论人（必填）
             - description: 内容（必填）
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单个图片直链，会以内嵌图片形式写入评论
-            - image_urls: 多个图片直链，会以内嵌图片形式写入评论
+            - image_url: 单张图片，会以内嵌图片形式写入评论。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频直链，会以内嵌视频形式写入评论
             - video_urls: 多个视频直链，会以内嵌视频形式写入评论
             - root_id: 根评论ID
@@ -1790,6 +1842,42 @@ def send_qiwei_message(msg: str) -> dict:
         "msg": msg,
     }
     return client.send_message(data)
+
+
+@mcp.tool()
+def upload_image(workspace_id: int, image_path: str) -> str:
+    """上传本机图片到 TAPD 图床，返回可直接内嵌到描述/评论里的图片地址。
+
+    多数情况下不需要单独调用本工具：create_bug / create_story_or_task /
+    create_comments 等工具的 image_url、image_urls 参数已经可以直接接收本机图片
+    绝对路径并自动完成上传。只有在需要先拿到地址、自己拼 description 时才用它。
+
+    Args:
+        workspace_id: 项目ID（必填）
+        image_path: 本机图片绝对路径（必填）。限 5MB 以内，
+                    支持 PNG/GIF/JPG/JPEG/BMP，一次一张。
+                    要求本 MCP server 与图片在同一台机器上。
+    Returns:
+        {
+            "image_src": <str>,   # 形如 /tfl/pictures/202608/api_xxx.png
+            "html_code": <str>    # 形如 <img src="/tfl/pictures/..."/>，可直接写入 description
+        }
+    """
+    if not os.path.isfile(image_path):
+        return json.dumps(
+            {"status": 0, "info": f"找不到文件：{image_path}"},
+            indent=2, ensure_ascii=False
+        )
+
+    size = os.path.getsize(image_path)
+    if size > _MAX_UPLOAD_BYTES:
+        return json.dumps(
+            {"status": 0, "info": f"图片为 {size} 字节，超过 TAPD 的 5MB 限制，请先压缩"},
+            indent=2, ensure_ascii=False
+        )
+
+    ret = client.upload_image(workspace_id, image_path)
+    return json.dumps(ret, indent=2, ensure_ascii=False)
 
 
 def start_mcp_server():

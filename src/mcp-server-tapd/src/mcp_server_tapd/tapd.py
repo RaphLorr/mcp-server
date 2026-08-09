@@ -78,6 +78,33 @@ class TAPDClient:
         
         return response.json()
 
+    def upload_image(self, workspace_id: Any, file_path: str) -> Dict:
+        """
+        上传本地图片到 TAPD 图床
+
+        走 multipart/form-data，不能复用 _make_request：后者以 json= 发送，
+        且 self.headers 里固定了 Content-Type: application/json，会让 requests
+        无法生成 multipart 的 boundary。这里显式剔除该头部。
+
+        返回 {"status": 1, "data": {"image_src": "/tfl/pictures/...", "html_code": "<img .../>"}}
+        """
+        if self.base_url is None:
+            self.base_url = os.getenv("TAPD_API_BASE_URL")
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "content-type"}
+        url = f"{self.base_url}/files/upload_image?s=mcp"
+
+        with open(file_path, "rb") as fh:
+            response = requests.post(
+                url,
+                headers=headers,
+                data={"workspace_id": workspace_id},
+                files={"image": (os.path.basename(file_path), fh)},
+                timeout=60
+            )
+        response.raise_for_status()
+        return response.json()
+
     def get_stories(self, params: Optional[Dict] = None) -> Dict:
         """
         获取需求或任务
