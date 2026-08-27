@@ -117,21 +117,29 @@ def _upload_local_images(media_items: list[dict], workspace_id) -> list[dict]:
 
     return resolved
 
+# 嵌入宽度上限。`max-width: 100%` 只防溢出、不限尺寸——它的意思是「最大到容器
+# 那么宽」，而 TAPD 的描述区很宽、手机截图本身又是 1000+ px，结果就是铺满整屏。
+# 上限写在外层容器而不是 <img> 上：这样窄容器下 <p> 会自己缩，图片跟着缩，
+# 不需要 CSS min() 也能两头都对。
+MEDIA_MAX_WIDTH_PX = 680
+
+
 def _render_media_html(media_items: list[dict]) -> str:
     blocks = []
+    wrap = f'<p style="max-width: {MEDIA_MAX_WIDTH_PX}px;">'
     for item in media_items:
         url = html.escape(item["url"], quote=True)
         if item["type"] == "image":
             alt = html.escape(item.get("alt", ""), quote=True)
             blocks.append(
-                f'<p><img src="{url}" alt="{alt}" style="max-width: 100%; height: auto;" /></p>'
+                f'{wrap}<img src="{url}" alt="{alt}" style="max-width: 100%; height: auto;" /></p>'
             )
             continue
 
         poster = item.get("poster", "")
         poster_attr = f' poster="{html.escape(poster, quote=True)}"' if poster else ""
         blocks.append(
-            f'<p><video controls src="{url}"{poster_attr} style="max-width: 100%;"></video></p>'
+            f'{wrap}<video controls src="{url}"{poster_attr} style="max-width: 100%;"></video></p>'
         )
     return "\n".join(blocks)
 
