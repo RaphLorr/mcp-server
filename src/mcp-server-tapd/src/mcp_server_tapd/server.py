@@ -123,6 +123,21 @@ def _upload_local_images(media_items: list[dict], workspace_id) -> list[dict]:
 # 不需要 CSS min() 也能两头都对。
 MEDIA_MAX_WIDTH_PX = 680
 
+# 高度上限。只限宽是不够的：手机截图是竖版的，1260x2844 限宽到 680 之后仍然是
+# 一面 1536px 高的墙，票读起来照样被它占满——第一版就漏了这一维。
+#
+# 内嵌图在这里的角色是「指路的缩略图」，不是阅读界面：TAPD 自己给图挂了
+# 点击放大（img.class 含 gallery，cursor: zoom-in），细节始终一点即看。
+# 所以宁可缩到看不清字，也要让票本身能当文档读。
+MEDIA_MAX_HEIGHT_PX = 480
+
+
+# 宽高都给上限、宽高都留 auto：浏览器取更严的那个约束，等比缩放，不裁剪。
+# 横版整页截图因此受宽度约束，竖版手机截图受高度约束，各自用合适的规则。
+_MEDIA_FIT = (
+    f"max-width: 100%; max-height: {MEDIA_MAX_HEIGHT_PX}px; width: auto; height: auto;"
+)
+
 
 def _render_media_html(media_items: list[dict]) -> str:
     blocks = []
@@ -132,14 +147,14 @@ def _render_media_html(media_items: list[dict]) -> str:
         if item["type"] == "image":
             alt = html.escape(item.get("alt", ""), quote=True)
             blocks.append(
-                f'{wrap}<img src="{url}" alt="{alt}" style="max-width: 100%; height: auto;" /></p>'
+                f'{wrap}<img src="{url}" alt="{alt}" style="{_MEDIA_FIT}" /></p>'
             )
             continue
 
         poster = item.get("poster", "")
         poster_attr = f' poster="{html.escape(poster, quote=True)}"' if poster else ""
         blocks.append(
-            f'{wrap}<video controls src="{url}"{poster_attr} style="max-width: 100%;"></video></p>'
+            f'{wrap}<video controls src="{url}"{poster_attr} style="{_MEDIA_FIT}"></video></p>'
         )
     return "\n".join(blocks)
 
