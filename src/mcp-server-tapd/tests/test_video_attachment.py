@@ -16,6 +16,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mcp_server_tapd.server import (  # noqa: E402
+    _attach_local_videos,
+    _human_size,
     _is_local_video_path,
     _render_tapd_video_html,
     _split_local_videos,
@@ -164,3 +166,81 @@ class SilentDropGuardTests(unittest.TestCase):
         self.assertEqual(pending, [])
         self.assertIn("<video", data["description"])
         self.assertIn("https://example.com/a.mp4", data["description"])
+
+
+class OversizeIsAWarningNotABlockerTests(unittest.TestCase):
+    """票必须建出来。超限只是少一个附件，不该把整张票挡下来。
+
+    尤其视频是建票**之后**才传的：抛异常的结果是"票建了、调用方收到失败"，
+    调用方多半会重试，于是多一张重复的票。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.big = Path(self._tmp.name) / "huge.mp4"
+        self.big.write_bytes(b"\x00" * 1024)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_oversize_video_warns_and_is_skipped(self) -> None:
+        warnings: list[str] = []
+        with patch("mcp_server_tapd.server._MAX_ATTACHMENT_BYTES", 512):
+            html_out = _attach_local_videos(1, "bug", 99, [str(self.big)], warnings)
+
+        self.assertEqual(html_out, "")  # 描述里没有这个视频
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("huge.mp4", warnings[0])
+        self.assertIn("未附到票上", warnings[0])
+
+    def test_upload_failure_warns_rather_than_raising(self) -> None:
+        warnings: list[str] = []
+        with patch("mcp_server_tapd.server.client") as fake:
+            fake.upload_attachment.side_effect = RuntimeError("boom")
+            html_out = _attach_local_videos(1, "bug", 99, [str(self.big)], warnings)
+
+        self.assertEqual(html_out, "")
+        self.assertIn("boom", warnings[0])
+
+    def test_api_says_failed_warns_rather_than_raising(self) -> None:
+        warnings: list[str] = []
+        with patch("mcp_server_tapd.server.client") as fake:
+            fake.upload_attachment.return_value = {"status": 0, "info": "quota exceeded"}
+            html_out = _attach_local_videos(1, "bug", 99, [str(self.big)], warnings)
+
+        self.assertEqual(html_out, "")
+        self.assertIn("quota exceeded", warnings[0])
+
+    def test_one_bad_video_does_not_lose_the_good_one(self) -> None:
+        good = Path(self._tmp.name) / "ok.mp4"
+        good.write_bytes(b"\x00")
+        warnings: list[str] = []
+        with patch("mcp_server_tapd.server.client") as fake, \
+                patch("mcp_server_tapd.server._MAX_ATTACHMENT_BYTES", 512):
+            fake.upload_attachment.return_value = {
+                "status": 1, "data": {"Attachment": {"id": "777"}}
+            }
+            html_out = _attach_local_videos(1, "bug", 99, [str(self.big), str(good)], warnings)
+
+        self.assertIn("777", html_out)          # 小的那个贴上去了
+        self.assertEqual(len(warnings), 1)      # 大的那个只记了一条警告
+
+    def test_oversize_image_warns_when_a_collector_is_given(self) -> None:
+        from mcp_server_tapd.server import _upload_local_images
+
+        img = Path(self._tmp.name) / "shot.png"
+        img.write_bytes(b"\x00" * 1024)
+        warnings: list[str] = []
+        with patch("mcp_server_tapd.server._MAX_UPLOAD_BYTES", 512):
+            out = _upload_local_images(
+                [{"type": "image", "url": str(img)}], 1, warnings
+            )
+
+        self.assertEqual(out, [])               # 这张图不进描述
+        self.assertIn("shot.png", warnings[0])
+
+
+class HumanSizeTests(unittest.TestCase):
+    def test_reports_megabytes(self) -> None:
+        self.assertEqual(_human_size(8 * 1024 * 1024), "8.0MB")
+
+    def test_falls_back_to_kilobytes(self) -> None:
+        self.assertEqual(_human_size(200 * 1024), "200KB")

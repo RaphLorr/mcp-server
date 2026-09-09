@@ -69,6 +69,12 @@ def _extract_media_items(data: dict) -> list[dict]:
 _UPLOADABLE_IMAGE_EXT = {".png", ".gif", ".jpg", ".jpeg", ".bmp"}
 _MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # TAPD upload_image 接口硬限制
 
+def _human_size(num_bytes: int) -> str:
+    """给人看的大小。报"8388608 字节"没人算得动。"""
+    mb = num_bytes / (1024 * 1024)
+    return f"{mb:.1f}MB" if mb >= 1 else f"{num_bytes / 1024:.0f}KB"
+
+
 _UPLOADABLE_VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 _MAX_ATTACHMENT_BYTES = 150 * 1024 * 1024  # TAPD upload_attachment 接口硬限制
 
@@ -122,28 +128,40 @@ def _render_tapd_video_html(workspace_id, attachment_id, attach_type: str) -> st
     )
 
 
-def _attach_local_videos(workspace_id, entity: str, entry_id, video_paths: list[str]) -> str:
+def _attach_local_videos(workspace_id, entity: str, entry_id, video_paths: list[str],
+                         warnings: list[str]) -> str:
     """建票之后把本地视频传上去，返回要追加进描述的 HTML。
 
-    任何一个失败都直接抛：宁可让上层看见错误，也不要建出一张「录屏悄悄没了」
-    的票——跟图片那条一样的取舍。
+    **这里一律不抛。**票此刻已经存在了，抛出去的结果是"票建了、调用方收到失败"
+    ——最糟的组合，调用方多半会重试，于是多出一张重复的票。所以每一个失败都
+    降级成警告：票留着，描述里少这一个视频，警告如实回给调用方去转达。
     """
     attach_type = _VIDEO_ATTACH_TYPE[entity]
     blocks = []
     for path in video_paths:
-        size = os.path.getsize(path)
-        if size > _MAX_ATTACHMENT_BYTES:
-            raise ValueError(
-                f"视频 {path} 为 {size} 字节，超过 TAPD 附件接口的 150MB 限制"
-            )
-        ret = client.upload_attachment(workspace_id, path, attach_type, entry_id)
-        if ret.get("status") != 1:
-            raise ValueError(f"上传视频 {path} 失败：{ret.get('info')}")
-        attachment = (ret.get("data") or {}).get("Attachment") or {}
-        attachment_id = attachment.get("id")
-        if not attachment_id:
-            raise ValueError(f"上传视频 {path} 后返回中没有 Attachment.id：{ret}")
-        blocks.append(_render_tapd_video_html(workspace_id, attachment_id, attach_type))
+        name = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+            if size > _MAX_ATTACHMENT_BYTES:
+                warnings.append(
+                    f"视频 {name} 为 {_human_size(size)}，超过 TAPD 附件 "
+                    f"{_human_size(_MAX_ATTACHMENT_BYTES)} 上限，未附到票上"
+                )
+                continue
+
+            ret = client.upload_attachment(workspace_id, path, attach_type, entry_id)
+            if ret.get("status") != 1:
+                warnings.append(f"视频 {name} 上传失败（{ret.get('info')}），未附到票上")
+                continue
+
+            attachment_id = ((ret.get("data") or {}).get("Attachment") or {}).get("id")
+            if not attachment_id:
+                warnings.append(f"视频 {name} 上传后没拿到附件 id，未附到票上")
+                continue
+
+            blocks.append(_render_tapd_video_html(workspace_id, attachment_id, attach_type))
+        except Exception as exc:  # noqa: BLE001 - 票已存在，任何异常都不能往上抛
+            warnings.append(f"视频 {name} 处理失败（{type(exc).__name__}: {exc}），未附到票上")
     return "\n".join(blocks)
 
 def _is_local_image_path(url: str) -> bool:
@@ -159,11 +177,17 @@ def _is_local_image_path(url: str) -> bool:
         return False
     return os.path.isfile(url)
 
-def _upload_local_images(media_items: list[dict], workspace_id) -> list[dict]:
+def _upload_local_images(media_items: list[dict], workspace_id,
+                         warnings: list[str] | None = None) -> list[dict]:
     """把本地图片路径上传到 TAPD 图床，替换成图床返回的 image_src。
 
-    非本地路径、非图片一律原样放行。任何一张图上传失败都直接抛出：
-    宁可整个调用失败让上层看见，也不要建出一张"图悄悄没了"的票。
+    非本地路径、非图片一律原样放行。
+
+    两类失败分开处理：
+    - **超限**是事先就知道、重试也没用的确定性情况 —— 跳过这一张、记一条警告，
+      票照建。为一张超大图把整张票挡下来，比缺一张图更糟。
+    - **上传失败**（网络、接口报错）是意外，仍然直接抛：这一步在建票之前，
+      抛出去不会留下孤票，而"悄悄少一张图"的票没人会发现。
     """
     if not workspace_id:
         return media_items
@@ -177,9 +201,14 @@ def _upload_local_images(media_items: list[dict], workspace_id) -> list[dict]:
 
         size = os.path.getsize(url)
         if size > _MAX_UPLOAD_BYTES:
-            raise ValueError(
-                f"图片 {url} 为 {size} 字节，超过 TAPD upload_image 的 5MB 限制，请先压缩"
+            msg = (
+                f"图片 {os.path.basename(url)} 为 {_human_size(size)}，"
+                f"超过 TAPD 图床 {_human_size(_MAX_UPLOAD_BYTES)} 上限，未附到票上"
             )
+            if warnings is None:
+                raise ValueError(msg)
+            warnings.append(msg)
+            continue
 
         ret = client.upload_image(workspace_id, url)
         if ret.get("status") != 1:
@@ -236,7 +265,8 @@ def _render_media_html(media_items: list[dict]) -> str:
     return "\n".join(blocks)
 
 def _render_rich_description(data: dict, field_name: str = "description",
-                             supports_local_video: bool = False) -> list[str]:
+                             supports_local_video: bool = False,
+                             warnings: list[str] | None = None) -> list[str]:
     """渲染描述，并把需要建票后才能传的本地视频路径回给调用方。
 
     `supports_local_video=False` 的调用点（比如评论）拿到本地视频会直接抛错，
@@ -249,7 +279,7 @@ def _render_rich_description(data: dict, field_name: str = "description",
         content = str(content)
 
     media_items, pending_videos = _split_local_videos(_extract_media_items(data))
-    media_items = _upload_local_images(media_items, data.get("workspace_id"))
+    media_items = _upload_local_images(media_items, data.get("workspace_id"), warnings)
     media_html = _render_media_html(media_items)
     if field_name not in data and not media_html and not pending_videos:
         return []
@@ -270,8 +300,8 @@ def _render_rich_description(data: dict, field_name: str = "description",
         )
     return pending_videos
 
-def _finalize_local_videos(entity: str, workspace_id, created: dict,
-                           payload: dict, pending_videos: list[str]) -> dict:
+def _finalize_local_videos(entity: str, workspace_id, created: dict, payload: dict,
+                           pending_videos: list[str], warnings: list[str]) -> dict:
     """建票之后把本地视频传上去、把 <video> 追加进描述、回写。
 
     分三步是接口决定的，不是选择：upload_attachment 要求 entry_id，而 entry_id
@@ -283,19 +313,26 @@ def _finalize_local_videos(entity: str, workspace_id, created: dict,
     key = "Bug" if entity == "bug" else "Story"
     entry_id = ((created.get("data") or {}).get(key) or {}).get("id")
     if not entry_id:
-        raise ValueError(f"创建返回里没有 {key}.id，无法挂载视频：{created}")
+        # 票已经建了，这里同样不能抛——降级成警告，让调用方看见视频没贴上去。
+        warnings.append(f"创建返回里没有 {key}.id，视频未附到票上")
+        return created
 
-    video_html = _attach_local_videos(workspace_id, entity, entry_id, pending_videos)
+    video_html = _attach_local_videos(workspace_id, entity, entry_id, pending_videos, warnings)
+    if not video_html:
+        return created
     description = payload.get("description") or ""
     updated = {
         "workspace_id": workspace_id,
         "id": entry_id,
         "description": f"{description}\n{video_html}" if description else video_html,
     }
-    if entity == "bug":
-        client.create_or_update_bug(updated)
-    else:
-        client.create_or_update_story(updated)
+    try:
+        if entity == "bug":
+            client.create_or_update_bug(updated)
+        else:
+            client.create_or_update_story(updated)
+    except Exception as exc:  # noqa: BLE001 - 票已存在
+        warnings.append(f"视频已上传但回填描述失败（{type(exc).__name__}: {exc}）")
     return created
 
 
@@ -699,10 +736,13 @@ def update_story_or_task(workspace_id: int, options: dict = None) -> str:
         options['entity_type'] = 'stories'
     if options:
         new_story.update(options)
-    pending_videos = _render_rich_description(new_story, supports_local_video=True)
+    warnings: list[str] = []
+    pending_videos = _render_rich_description(
+        new_story, supports_local_video=True, warnings=warnings
+    )
     created_story = client.create_or_update_story(new_story)
     created_story = _finalize_local_videos(
-        "story", workspace_id, created_story, new_story, pending_videos
+        "story", workspace_id, created_story, new_story, pending_videos, warnings
     )
     config = AppConfig()
     if config.tapd_base_url is None:
@@ -714,7 +754,8 @@ def update_story_or_task(workspace_id: int, options: dict = None) -> str:
     url_template = get_story_or_task_url_template(workspace_id, entity_type, tapd_base_url)
     return json.dumps({
         "url_template": url_template,
-        "data": json.dumps(created_story, indent=2, ensure_ascii=False)
+        "data": json.dumps(created_story, indent=2, ensure_ascii=False),
+        **({"warnings": warnings} if warnings else {}),
     }, ensure_ascii=False, indent=2)
 
 @mcp.tool()
@@ -848,11 +889,12 @@ def create_story_or_task(workspace_id: int, name: str, options: dict = None) -> 
     if options:
         data.update(options)
     
-    pending_videos = _render_rich_description(data, supports_local_video=True)
+    warnings: list[str] = []
+    pending_videos = _render_rich_description(data, supports_local_video=True, warnings=warnings)
 
     created_story = client.create_or_update_story(data)
     created_story = _finalize_local_videos(
-        "story", workspace_id, created_story, data, pending_videos
+        "story", workspace_id, created_story, data, pending_videos, warnings
     )
     config = AppConfig()
     if config.tapd_base_url is None:
@@ -1010,12 +1052,17 @@ def update_bug(workspace_id: int, options: dict = None) -> dict:
     if options:
         new_bug.update(options)
 
-    pending_videos = _render_rich_description(new_bug, supports_local_video=True)
+    warnings: list[str] = []
+    pending_videos = _render_rich_description(
+        new_bug, supports_local_video=True, warnings=warnings
+    )
     user_nick = os.getenv("CURRENT_USER_NICK")
     if 'lastmodify' not in new_bug and user_nick:
         new_bug['lastmodify'] = user_nick
     created_bug = client.create_or_update_bug(new_bug)
-    created_bug = _finalize_local_videos("bug", workspace_id, created_bug, new_bug, pending_videos)
+    created_bug = _finalize_local_videos(
+        "bug", workspace_id, created_bug, new_bug, pending_videos, warnings
+    )
     config = AppConfig()
     if config.tapd_base_url is None:
         tapd_base_url = os.getenv("TAPD_BASE_URL")
@@ -1023,7 +1070,8 @@ def update_bug(workspace_id: int, options: dict = None) -> dict:
         tapd_base_url = config.tapd_base_url
     return {
         "base_url": tapd_base_url, # 返回给用户时，链接要可点击
-        "data": json.dumps(created_bug, indent=2, ensure_ascii=False)
+        "data": json.dumps(created_bug, indent=2, ensure_ascii=False),
+        **({"warnings": warnings} if warnings else {}),
     }
 
 @mcp.tool()
@@ -1062,8 +1110,10 @@ def create_bug(workspace_id: int, title: str, options: dict = None) -> dict:
             等等...
     Returns:
         {
-            "data": <str>,  # 所有字段数据的 json 格式
-            "url": <str>  #  url，返回给用户时，链接要可点击
+            "data": <str>,      # 所有字段数据的 json 格式
+            "url": <str>,       #  url，返回给用户时，链接要可点击
+            "warnings": [<str>] # 可选。票已建好，但有附件没贴上（超限/上传失败）。
+                                # 有这个字段就如实转达给用户，不要重试建票
         }
     Note: 缺陷链接格式为 {tapd_base_url}/{workspace_id}/bugtrace/bugs/view/{id}
     """
@@ -1082,12 +1132,15 @@ def create_bug(workspace_id: int, title: str, options: dict = None) -> dict:
     if options:
         new_bug.update(options)
     
-    pending_videos = _render_rich_description(new_bug, supports_local_video=True)
+    warnings: list[str] = []
+    pending_videos = _render_rich_description(
+        new_bug, supports_local_video=True, warnings=warnings
+    )
     user_nick = os.getenv("CURRENT_USER_NICK")
     if 'reporter' not in new_bug and user_nick:
         new_bug['reporter'] = user_nick
     ret = client.create_or_update_bug(new_bug)
-    ret = _finalize_local_videos("bug", workspace_id, ret, new_bug, pending_videos)
+    ret = _finalize_local_videos("bug", workspace_id, ret, new_bug, pending_videos, warnings)
     config = AppConfig()
     if config.tapd_base_url is None:
         tapd_base_url = os.getenv("TAPD_BASE_URL")
@@ -1096,6 +1149,8 @@ def create_bug(workspace_id: int, title: str, options: dict = None) -> dict:
     return {
         "url": f'{tapd_base_url}/{workspace_id}/bugtrace/bugs/view/{ret["data"]["Bug"]["id"]}', # 返回给用户时，链接要可点击
         "data": json.dumps(ret, indent=2, ensure_ascii=False),
+        # 票建成了但有附件没贴上：如实转达，别让用户以为录屏在票里
+        **({"warnings": warnings} if warnings else {}),
     }
 
 @mcp.tool()
