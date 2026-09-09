@@ -96,7 +96,7 @@ class SplitLocalVideosTests(unittest.TestCase):
 class RenderTapdVideoHtmlTests(unittest.TestCase):
     """模板是从网页端建的真票里逆出来的，改动会让票里播不了，所以锁死。"""
 
-    def _html(self, attach_type: str = "bug_description") -> str:
+    def _html(self, attach_type: str = "bug") -> str:
         with patch.dict(os.environ, {"TAPD_BASE_URL": "https://www.tapd.cn"}, clear=False):
             return _render_tapd_video_html(64984633, "1164984633001000202", attach_type)
 
@@ -104,7 +104,7 @@ class RenderTapdVideoHtmlTests(unittest.TestCase):
         got = self._html()
         src = (
             "https://www.tapd.cn/64984633/attachments/preview_attachments/"
-            "1164984633001000202/bug_description"
+            "1164984633001000202/bug"
         )
         poster = (
             "https://www.tapd.cn/64984633/attachments/preview_video_poster/1164984633001000202"
@@ -118,8 +118,8 @@ class RenderTapdVideoHtmlTests(unittest.TestCase):
 
     def test_url_carries_the_attachment_type(self) -> None:
         # 路径末段就是 type，story 走另一个挂载点
-        got = self._html("story_description_attachment")
-        self.assertIn("/1164984633001000202/story_description_attachment", got)
+        got = self._html("story")
+        self.assertIn("/1164984633001000202/story", got)
 
     def test_src_is_stable_not_a_signed_download_url(self) -> None:
         # 用 download_url 会过期，票过几天就播不了
@@ -244,3 +244,42 @@ class HumanSizeTests(unittest.TestCase):
 
     def test_falls_back_to_kilobytes(self) -> None:
         self.assertEqual(_human_size(200 * 1024), "200KB")
+
+
+class UploadTypeTests(unittest.TestCase):
+    """上传接口只认实体名本身。
+
+    2026-09-09 实测：story ✅；story_description / story_attachment /
+    story_description_attachment / stories / workitem 全部 422 "type is invalid"。
+    第一版从 GET /attachments 的返回里抄了 bug_description，每次 422，
+    而 422 当时又被吞掉，表现成"没报错但也没传上"。
+    """
+
+    def test_uses_the_bare_entity_name(self) -> None:
+        from mcp_server_tapd.server import _VIDEO_ATTACH_TYPE
+
+        self.assertEqual(_VIDEO_ATTACH_TYPE["bug"], "bug")
+        self.assertEqual(_VIDEO_ATTACH_TYPE["story"], "story")
+
+    def test_never_the_description_variants(self) -> None:
+        from mcp_server_tapd.server import _VIDEO_ATTACH_TYPE
+
+        for value in _VIDEO_ATTACH_TYPE.values():
+            self.assertNotIn("description", value)
+            self.assertNotIn("attachment", value)
+
+    def test_upload_is_called_with_that_type(self) -> None:
+        import tempfile as tf
+        from unittest.mock import patch as _patch
+
+        from mcp_server_tapd.server import _attach_local_videos
+
+        with tf.TemporaryDirectory() as d:
+            v = Path(d) / "rec.mp4"
+            v.write_bytes(b"\x00")
+            with _patch("mcp_server_tapd.server.client") as fake:
+                fake.upload_attachment.return_value = {
+                    "status": 1, "data": {"Attachment": {"id": "1"}}
+                }
+                _attach_local_videos(64984633, "story", "S1", [str(v)], [])
+            self.assertEqual(fake.upload_attachment.call_args.args[2], "story")

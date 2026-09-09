@@ -78,10 +78,16 @@ def _human_size(num_bytes: int) -> str:
 _UPLOADABLE_VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 _MAX_ATTACHMENT_BYTES = 150 * 1024 * 1024  # TAPD upload_attachment 接口硬限制
 
-# 挂载点。TAPD 文档没枚举 type 的取值，这两个是从真实空间已有附件里读出来的。
+# 挂载点。文档没枚举 type 的取值，实测（2026-09-09，真实空间）**上传接口只认
+# 实体名本身**：story / bug 可以，story_description / story_description_attachment /
+# story_attachment / stories / workitem 全部 422 "type is invalid"。
+#
+# 别被 GET /attachments 的返回误导：那里确实存在 bug_description 这种 type，但那是
+# 网页端走另一套内部接口写进去的形态，上传 API 不接受。我第一版就是从那里抄的值，
+# 结果每次都 422，而 422 又被吞掉了（见下面 warnings 的修复），表现成"没报错但也没传上"。
 _VIDEO_ATTACH_TYPE = {
-    "bug": "bug_description",
-    "story": "story_description_attachment",
+    "bug": "bug",
+    "story": "story",
 }
 
 
@@ -912,6 +918,8 @@ def create_story_or_task(workspace_id: int, name: str, options: dict = None) -> 
     return {
         "url_template": url_template,
         "data": json.dumps(created_story, indent=2, ensure_ascii=False),
+        # 漏掉这一行的代价：附件上传失败被完全吞掉，调用方看到一切正常。
+        **({"warnings": warnings} if warnings else {}),
     }
 
 @mcp.tool()
