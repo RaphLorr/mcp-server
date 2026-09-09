@@ -105,6 +105,47 @@ class TAPDClient:
         response.raise_for_status()
         return response.json()
 
+    def upload_attachment(self, workspace_id: Any, file_path: str,
+                          attach_type: str, entry_id: Any) -> Dict:
+        """
+        上传本地文件为工作项附件（图片以外的东西都走这里，视频尤其）
+
+        跟 upload_image 是两个接口：upload_image 只吃图片、进的是图床，返回
+        image_src；这个接口进的是附件库，返回 Attachment.id，而且必须指定挂在
+        哪个工作项上（entry_id），所以只能在票建出来之后调。
+
+        attach_type 决定挂到哪儿。TAPD 文档没有枚举，以下取值是从真实空间的
+        已有附件里读出来的：
+          bug / story                          挂到附件列表
+          bug_description                      内嵌进缺陷描述
+          story_description_attachment         内嵌进需求描述
+
+        单文件上限 150MB。返回
+        {"status": 1, "data": {"Attachment": {"id": "...", ...}}}
+        """
+        if self.base_url is None:
+            self.base_url = os.getenv("TAPD_API_BASE_URL")
+
+        # 同 upload_image：multipart 要自己生成 boundary，固定的
+        # Content-Type: application/json 会把它废掉。
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "content-type"}
+        url = f"{self.base_url}/files/upload_attachment?s=mcp"
+
+        with open(file_path, "rb") as fh:
+            response = requests.post(
+                url,
+                headers=headers,
+                data={
+                    "workspace_id": workspace_id,
+                    "type": attach_type,
+                    "entry_id": entry_id,
+                },
+                files={"file": (os.path.basename(file_path), fh)},
+                timeout=300,  # 视频比图片大得多，5MB 的超时不够用
+            )
+        response.raise_for_status()
+        return response.json()
+
     def get_stories(self, params: Optional[Dict] = None) -> Dict:
         """
         获取需求或任务
