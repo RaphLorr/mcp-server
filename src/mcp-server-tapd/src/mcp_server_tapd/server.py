@@ -14,6 +14,40 @@ else:
     mcp = FastMCP("mcp-tapd")
 client = TAPDClient()
 
+# OpenClaw 把入站文件落到 <媒体目录>/inbound/<id>，但给模型看的引用是
+# `media://inbound/<id>`（core 在消息里追加 "[media attached: media://inbound/…]"）。
+# 模型拿到的就是这个形态，原样传进 image_url 是它唯一能做的事——2026-09-10 那条
+# "补充截图"评论就是这么坏的：media:// 既不是本地路径也不是 http，被原样写进
+# <img src>，TAPD 渲染成灰色占位，而 bot 还回了句"截图也带上了"。
+# 媒体目录与 MCP 同机（stdio 模式的前提，和 _is_local_image_path 的假设一致）。
+_MEDIA_REF_PREFIX = "media://"
+_OPENCLAW_MEDIA_DIR = os.path.expanduser(os.getenv("OPENCLAW_MEDIA_DIR", "~/.openclaw/media"))
+
+
+def _resolve_media_ref(url: str) -> str:
+    """把 `media://<子目录>/<文件>` 还原成本机绝对路径；不是这种引用就原样返回。
+
+    找不到文件直接抛：这是「静默丢图」的源头，宁可评论/票不建，也不要贴一张
+    打不开的图然后告诉用户已经带上了。`..` 一律拒绝，别让一个引用逃出媒体目录。
+    """
+    if not isinstance(url, str) or not url.startswith(_MEDIA_REF_PREFIX):
+        return url
+    rel = url[len(_MEDIA_REF_PREFIX):].strip().lstrip("/")
+    parts = [seg for seg in rel.split("/") if seg]
+    if not parts or any(seg in ("..", ".") for seg in parts):
+        raise ValueError(f"非法的媒体引用：{url}")
+    path = os.path.realpath(os.path.join(_OPENCLAW_MEDIA_DIR, *parts))
+    root = os.path.realpath(_OPENCLAW_MEDIA_DIR)
+    if not (path == root or path.startswith(root + os.sep)):
+        raise ValueError(f"媒体引用越出媒体目录：{url}")
+    if not os.path.isfile(path):
+        raise ValueError(
+            f"媒体引用 {url} 在本机找不到对应文件（查找路径 {path}）。"
+            "可能已被清理，或 MCP 与文件不在同一台机器。"
+        )
+    return path
+
+
 def _normalize_media_items(raw_media) -> list[dict]:
     """Normalize supported media parameters into a single list."""
     if not raw_media:
@@ -64,7 +98,10 @@ def _extract_media_items(data: dict) -> list[dict]:
                         "poster": "",
                     })
 
-    return [item for item in media_items if item.get("url")]
+    return [
+        {**item, "url": _resolve_media_ref(item["url"])}
+        for item in media_items if item.get("url")
+    ]
 
 _UPLOADABLE_IMAGE_EXT = {".png", ".gif", ".jpg", ".jpeg", ".bmp"}
 _MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # TAPD upload_image 接口硬限制
@@ -697,7 +734,7 @@ def update_story_or_task(workspace_id: int, options: dict = None) -> str:
             - priority_label: 优先级，需要先检查get_stories_fields_info是否配置了候选值，如果不存在则使用默认的候选值 High => 高、Middle => 中、Low => 低、Nice To Have => 无关紧要，不使用 priority 字段
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床；消息里给出的 media://inbound/xxx 引用也可以直接传
             - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频，可以是公网直链，也可以是本机视频的绝对路径（如 /root/.openclaw/media/inbound/xxx.mp4）。本地路径会在票创建后自动上传为 TAPD 附件并内嵌进描述，可在票里直接播放，不需要任何外部图床或直链。单文件限 150MB
             - video_urls: 多个视频，规则同 video_url，传数组
@@ -775,7 +812,7 @@ def create_story_or_task(workspace_id: int, name: str, options: dict = None) -> 
             - priority_label: 优先级，需要先检查get_stories_fields_info是否配置了候选值，如果不存在则使用默认的候选值 High => 高、Middle => 中、Low => 低、Nice To Have => 无关紧要，不使用 priority 字段
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床；消息里给出的 media://inbound/xxx 引用也可以直接传
             - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频，可以是公网直链，也可以是本机视频的绝对路径（如 /root/.openclaw/media/inbound/xxx.mp4）。本地路径会在票创建后自动上传为 TAPD 附件并内嵌进描述，可在票里直接播放，不需要任何外部图床或直链。单文件限 150MB
             - video_urls: 多个视频，规则同 video_url，传数组
@@ -1034,7 +1071,7 @@ def update_bug(workspace_id: int, options: dict = None) -> dict:
             - title: 标题
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床；消息里给出的 media://inbound/xxx 引用也可以直接传
             - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频，可以是公网直链，也可以是本机视频的绝对路径（如 /root/.openclaw/media/inbound/xxx.mp4）。本地路径会在票创建后自动上传为 TAPD 附件并内嵌进描述，可在票里直接播放，不需要任何外部图床或直链。单文件限 150MB
             - video_urls: 多个视频，规则同 video_url，传数组
@@ -1101,7 +1138,7 @@ def create_bug(workspace_id: int, title: str, options: dict = None) -> dict:
             - confirmer: 验证人员
             - description: 描述
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_url: 单张图片，会以内嵌图片形式写入描述。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床；消息里给出的 media://inbound/xxx 引用也可以直接传
             - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频，可以是公网直链，也可以是本机视频的绝对路径（如 /root/.openclaw/media/inbound/xxx.mp4）。本地路径会在票创建后自动上传为 TAPD 附件并内嵌进描述，可在票里直接播放，不需要任何外部图床或直链。单文件限 150MB
             - video_urls: 多个视频，规则同 video_url，传数组
@@ -1173,7 +1210,7 @@ def create_comments(workspace_id: int, options: dict = None) -> dict:
             - author: 评论人（必填）
             - description: 内容（必填）
             - media: 富媒体列表，支持 [{"type": "image"|"video", "url": "...", "alt": "...", "poster": "..."}]
-            - image_url: 单张图片，会以内嵌图片形式写入评论。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床
+            - image_url: 单张图片，会以内嵌图片形式写入评论。可以是公网直链，也可以是本机图片的绝对路径（如 /root/.openclaw/media/inbound/xxx.png），本地路径会自动上传到 TAPD 图床后再内嵌，无需自己找图床；消息里给出的 media://inbound/xxx 引用也可以直接传
             - image_urls: 多张图片，规则同 image_url，传数组
             - video_url: 单个视频直链，会以内嵌视频形式写入评论
             - video_urls: 多个视频直链，会以内嵌视频形式写入评论
@@ -1194,10 +1231,15 @@ def create_comments(workspace_id: int, options: dict = None) -> dict:
     
     if options:
         data.update(options)
-    
-    _render_rich_description(data)
-    created_story = client.create_comments(data)
-    return json.dumps(created_story, indent=2, ensure_ascii=False)
+
+    # warnings 必须回给调用方。之前这里把它丢了，超限/失败的图就"没报错但也没
+    # 传上"，bot 会对用户说"截图也带上了"——最坏的失败方式。
+    warnings: list[str] = []
+    _render_rich_description(data, warnings=warnings)
+    created = client.create_comments(data)
+    if warnings and isinstance(created, dict):
+        created = {**created, "warnings": warnings}
+    return json.dumps(created, indent=2, ensure_ascii=False)
 
 @mcp.tool()
 def update_comments(workspace_id: int, options: dict = None) -> dict:
