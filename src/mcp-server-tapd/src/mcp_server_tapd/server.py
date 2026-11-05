@@ -6,6 +6,7 @@ import markdown
 from mcp.server.fastmcp import FastMCP
 from mcp_server_tapd.tapd import TAPDClient
 from mcp_server_tapd.app_config import AppConfig
+from mcp_server_tapd.workflow_guard import validate_status_change
 from mcp_server_tapd.attachments import prepare_attachments, finalize_attachments, upload_files, VIDEO_EXTENSIONS
 
 config = AppConfig()
@@ -701,6 +702,7 @@ def update_story_or_task(workspace_id: int, options: dict = None) -> str:
     不解压 ZIP，不解析邮件。视频上传与 preview_status 分别检查，预览失败不能重传已成功附件。
     必须检查返回 data 内 attachment_results 和 warnings，不能把建票成功当成附件成功。
     更新 TAPD 需求或任务，任务的状态只有三个，open: 未开始，progressing: 进行中，done: 已完成，如果是流转需求的状态，需要调用工具先获取状态信息get_workflows_all_transitions
+    状态写入前服务端会按项目和需求类别校验合法状态及直接流转；非法状态会拒绝并返回候选值，不会自动把 end 当成关闭状态。关闭目标需结合 get_workflows_last_steps 判断。
     TAPD API 文档：https://open.tapd.cn/document/api-doc/API%E6%96%87%E6%A1%A3/api_reference/story/update_story.html
     Args:
         workspace_id: 项目ID（必填）
@@ -758,6 +760,7 @@ def update_story_or_task(workspace_id: int, options: dict = None) -> str:
         options['entity_type'] = 'stories'
     if options:
         new_story.update(options)
+    validate_status_change(client, new_story, new_story.get('entity_type', 'stories'))
     pending_attachments = prepare_attachments(new_story, _resolve_media_ref)
     warnings: list[str] = []
     pending_videos = _render_rich_description(
@@ -918,6 +921,7 @@ def create_story_or_task(workspace_id: int, name: str, options: dict = None) -> 
     if options:
         data.update(options)
     
+    validate_status_change(client, data, data.get('entity_type', 'stories'))
     pending_attachments = prepare_attachments(data, _resolve_media_ref)
     warnings: list[str] = []
     pending_videos = _render_rich_description(data, supports_local_video=True, warnings=warnings)
@@ -1056,6 +1060,7 @@ def update_bug(workspace_id: int, options: dict = None) -> dict:
     不解压 ZIP，不解析邮件。视频上传与 preview_status 分别检查，预览失败不能重传已成功附件。
     必须检查返回 data 内 attachment_results 和 warnings，不能把建票成功当成附件成功。
     更新 TAPD 缺陷
+    状态写入前会按当前项目校验状态及直接流转；使用 get_workflows_last_steps 获取结束状态，不得跨项目猜测 closed/end。
     TAPD API 文档：https://open.tapd.cn/document/api-doc/API%E6%96%87%E6%A1%A3/api_reference/bug/update_bug.html
     Args:
         workspace_id: 项目ID（必填）
@@ -1090,6 +1095,7 @@ def update_bug(workspace_id: int, options: dict = None) -> dict:
     if options:
         new_bug.update(options)
 
+    validate_status_change(client, new_bug, 'bug')
     pending_attachments = prepare_attachments(new_bug, _resolve_media_ref)
     warnings: list[str] = []
     pending_videos = _render_rich_description(
@@ -1177,6 +1183,7 @@ def create_bug(workspace_id: int, title: str, options: dict = None) -> dict:
     if options:
         new_bug.update(options)
     
+    validate_status_change(client, new_bug, 'bug')
     pending_attachments = prepare_attachments(new_bug, _resolve_media_ref)
     warnings: list[str] = []
     pending_videos = _render_rich_description(
