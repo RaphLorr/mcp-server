@@ -78,6 +78,15 @@ class TAPDClient:
         
         return response.json()
 
+    def list_ticket_attachments(self, filters: Dict) -> Dict:
+        return self._make_request("GET", "attachments", params=filters)
+
+    def get_ticket_attachment_download(self, workspace_id: int, attachment_id: str) -> Dict:
+        return self._make_request("GET", "attachments/down", params={
+            "workspace_id": workspace_id,
+            "id": attachment_id,
+        })
+
     def upload_image(self, workspace_id: Any, file_path: str) -> Dict:
         """
         上传本地图片到 TAPD 图床

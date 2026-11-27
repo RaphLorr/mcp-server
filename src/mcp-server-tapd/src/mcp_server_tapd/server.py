@@ -7,6 +7,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp_server_tapd.tapd import TAPDClient
 from mcp_server_tapd.app_config import AppConfig
 from mcp_server_tapd.workflow_guard import validate_status_change
+from mcp_server_tapd.attachment_download import AttachmentDownloadError, download_ticket_files
 from mcp_server_tapd.attachments import prepare_attachments, finalize_attachments, upload_files, VIDEO_EXTENSIONS
 
 config = AppConfig()
@@ -2143,6 +2144,34 @@ def upload_image(workspace_id: int, image_path: str) -> str:
 
     ret = client.upload_image(workspace_id, image_path)
     return json.dumps(ret, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def download_ticket_attachments(
+    workspace_id: int, entry_id: str, entity_type: str,
+    attachment_id: str | None = None, page: int = 1,
+) -> dict:
+    """下载 TAPD 需求或缺陷的附件原件到 OpenClaw 媒体目录。
+
+    Args:
+        workspace_id: TAPD 项目 ID
+        entry_id: 需求或缺陷的完整工作项 ID
+        entity_type: story（需求）或 bug（缺陷）
+        attachment_id: 可选，指定同一工作项下的单个附件 ID；省略时下载该页全部
+        page: 附件清单页码，从 1 开始。若返回 next_page，可继续下载下一页
+
+    返回每份附件的 filename、status、local_path、size_bytes 或错误。
+    仅读取 TAPD，临时签名下载链接不会返回给调用方。
+    """
+    try:
+        return download_ticket_files(
+            client, workspace_id, entry_id, entity_type,
+            os.path.join(_OPENCLAW_MEDIA_DIR, "inbound"), attachment_id, page,
+        )
+    except AttachmentDownloadError as error:
+        return {"error": str(error)}
+    except (requests.RequestException, ValueError, OSError):
+        return {"error": "TAPD 附件查询失败，请核对工作项及当前凭证权限。"}
 
 
 @mcp.tool()
